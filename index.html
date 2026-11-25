@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Face Lab</title>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/dist/face-api.js"></script>
+<style>
+:root{--bg:#fafafa;--fg:#222;--card:#fff;--line:#ddd;--sec:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--card:#1c1c1e;--line:#333;--sec:#333}}
+body{font-family:system-ui,sans-serif;margin:0 auto;padding:16px;max-width:480px;background:var(--bg);color:var(--fg)}
+h1{font-size:1.3rem}h2{font-size:1.05rem;margin-top:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+input[type=text]{width:100%;padding:10px;font-size:1rem;box-sizing:border-box;margin-bottom:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+button,label.btn{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:1rem;margin:4px 4px 4px 0}
+.sec{background:var(--sec)!important;color:var(--fg)!important}
+input[type=file]{display:none}
+.row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
+.good{color:#16a34a;font-weight:600}.bad{color:#dc2626}
+#msg,#out,#status,#liveMsg{white-space:pre-wrap;margin-top:8px}
+#stage{position:relative;display:none;margin-top:8px;background:#000;border-radius:10px;overflow:hidden}
+#stage video,#stage canvas{display:block;width:100%}
+#stage canvas{position:absolute;inset:0;height:100%}
+video.mirror{transform:scaleX(-1)}
+</style></head><body>
+<h1>Face Lab</h1>
+<div id="status">Loading models…</div>
+
+<div class="card"><h2>1. Add photos to the dataset</h2>
+<input type="text" id="name" placeholder="Person's name (e.g. me)">
+<label class="btn" for="up">Choose photos</label>
+<label class="btn sec" for="cam">Take photo</label>
+<input type="file" id="up" accept="image/*" multiple>
+<input type="file" id="cam" accept="image/*" capture="user">
+<div id="msg"></div>
+<div id="people" style="margin-top:10px"></div></div>
+
+<div class="card"><h2>2. Test a photo</h2>
+<label class="btn" for="t1">Choose photo</label>
+<label class="btn sec" for="t2">Take photo</label>
+<input type="file" id="t1" accept="image/*"><input type="file" id="t2" accept="image/*" capture="user">
+<div style="margin-top:8px">Threshold: <b id="tv">0.60</b> (lower = stricter)
+<input type="range" id="th" min="0.3" max="0.9" step="0.01" value="0.6" style="width:100%"></div>
+<div id="out"></div>
+<div style="margin-top:10px"><label class="btn sec" for="dbgIn">Debug a photo</label>
+<input type="file" id="dbgIn" accept="image/*"><div id="dbg" style="margin-top:8px;font-size:.9rem"></div></div></div>
+
+<div class="card"><h2>3. Live recognition</h2>
+<button id="camStart">Start camera</button>
+<button id="camFlip" class="sec">Flip</button>
+<button id="camStop" class="sec">Stop</button>
+<div id="liveMsg"></div>
+<div id="stage"><video id="vid" playsinline muted></video><canvas id="ov"></canvas></div>
+<div style="margin-top:8px;font-size:.9rem;opacity:.7">Uses the threshold slider above. Green = recognized, red = unknown.</div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const MODELS = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/";
+const KEY = "facelab-db";
+let db = {}, last = null, ready = false;
+try { db = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { db = {}; }
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { alert("Could not save: storage full or blocked."); } };
+
+async function loadModels() {
+  ready = false;
+  try {
+    await faceapi.tf.ready();
+    await faceapi.nets.ssdMobilenetv1.loadFromUri(MODELS);
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS);
+    await faceapi.nets.faceLandmark68Net.loadFromUri(MODELS);
+    await faceapi.nets.faceRecognitionNet.loadFromUri(MODELS);
+    ready = true;
+    $("status").textContent = "Ready (" + faceapi.tf.getBackend() + " mode). Everything runs on this device.";
+  } catch (e) { $("status").textContent = "Could not load models: " + (e.message || e); }
+}
+loadModels();
+let triedCpu = false;
+
+function loadImg(file) {
+  return new Promise((res, rej) => {
+    const u = URL.createObjectURL(file), i = new Image();
+    i.onload = () => { URL.revokeObjectURL(u); res(i); };
+    i.onerror = () => { URL.revokeObjectURL(u); rej(new Error("this browser can't decode the file (type: " + (file.type || "unknown") + ")")); };
+    i.src = u;
+  });
+}
+
+function toCanvas(img, deg) {
+  const s = Math.min(1, 1024 / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.round(img.naturalWidth * s), h = Math.round(img.naturalHeight * s);
+  const c = document.createElement("canvas"), swap = deg % 180 !== 0;
+  c.width = swap ? h : w; c.height = swap ? w : h;
+  const g = c.getContext("2d");
+  g.translate(c.width / 2, c.height / 2); g.rotate(deg * Math.PI / 180);
+  g.drawImage(img, -w / 2, -h / 2, w, h);
+  return c;
+}
+
+async function detectOnce(canvas) {
+  const ssd = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.2 });
+  let faces = await faceapi.detectAllFaces(canvas, ssd).withFaceLandmarks().withFaceDescriptors();
+  if (faces.length) return faces;
+  const tiny = new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 });
+  return faceapi.detectAllFaces(canvas, tiny).withFaceLandmarks().withFaceDescriptors();
+}
+
+async function runAll(img) {  // also tries rotations in case orientation metadata was ignored
+  for (const deg of [0, 90, 270]) {
+    const faces = await detectOnce(toCanvas(img, deg));
+    if (faces.length) return faces;
+  }
+  return [];
+}
+
+async function getDescriptor(file) {
+  const img = await loadImg(file);
+  let faces = await runAll(img);
+  if (!faces.length && !triedCpu && faceapi.tf.getBackend() !== "cpu") {
+    triedCpu = true;  // GPU mode may be producing bad results on this phone; retry on CPU
+    $("status").textContent = "No faces found, switching to CPU mode (slower but more compatible)…";
+    await faceapi.tf.setBackend("cpu");
+    await loadModels();
+    faces = await runAll(img);
+  }
+  if (faces.length > 1) return { err: "multiple faces" };
+  if (!faces.length) return { err: "no face found (tried both detectors, all orientations, GPU and CPU)" };
+  return { d: Array.from(faces[0].descriptor) };
+}
+
+function dist(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += (a[i] - b[i]) ** 2; return Math.sqrt(s); }
+
+function renderPeople() {
+  $("people").innerHTML = Object.entries(db).map(([n, v]) =>
+    `<div class="row"><span>${n.replace(/</g, "&lt;")} (${v.length} photos)</span><button class="sec" data-n="${encodeURIComponent(n)}">Delete</button></div>`
+  ).join("") || "No one enrolled yet.";
+  $("people").querySelectorAll("button").forEach(b => b.onclick = () => {
+    const n = decodeURIComponent(b.dataset.n);
+    if (confirm("Delete " + n + "?")) { delete db[n]; save(); renderPeople(); }
+  });
+}
+
+async function enroll(files) {
+  if (!files.length) return;
+  const name = $("name").value.trim().toLowerCase();
+  if (!name) { $("msg").textContent = "Enter a name first."; return; }
+  if (!ready) { $("msg").textContent = "Models still loading…"; return; }
+  let added = 0; const failed = [];
+  for (let i = 0; i < files.length; i++) {
+    $("msg").textContent = `Processing ${i + 1}/${files.length}…`;
+    try {
+      const r = await getDescriptor(files[i].blob);
+      if (r.d) { (db[name] = db[name] || []).push(r.d); added++; } else failed.push(files[i].name + ": " + r.err);
+    } catch (e) { failed.push(files[i].name + ": " + (e.message || e)); }
+  }
+  save(); renderPeople();
+  $("msg").textContent = `Added ${added}.` + (failed.length ? "\nSkipped:\n" + failed.join("\n") : "");
+}
+
+async function test(file) {
+  if (!file) return;
+  if (!ready) { $("out").textContent = "Models still loading…"; return; }
+  $("out").textContent = "Analyzing…";
+  try {
+    const r = await getDescriptor(file);
+    if (!r.d) { $("out").textContent = r.err; last = null; return; }
+    last = Object.entries(db).map(([n, v]) => ({ name: n, distance: Math.min(...v.map(e => dist(r.d, e))) }))
+      .sort((a, b) => a.distance - b.distance);
+    render();
+  } catch (e) { $("out").textContent = "Error: " + (e.message || e); }
+}
+
+function render() {
+  if (!last) return;
+  if (!last.length) { $("out").textContent = "Dataset is empty."; return; }
+  const t = parseFloat($("th").value);
+  $("out").innerHTML = last.map(r => {
+    const ok = r.distance < t;
+    return `<div class="row"><span>${r.name.replace(/</g, "&lt;")}</span><span class="${ok ? "good" : "bad"}">${r.distance.toFixed(3)} ${ok ? "MATCH" : "no match"}</span></div>`;
+  }).join("");
+}
+
+$("th").oninput = () => { $("tv").textContent = (+$("th").value).toFixed(2); render(); };
+// Copy files into memory BEFORE clearing the input; clearing first can make the file unreadable on phones.
+async function snapshot(fileList) {
+  return Promise.all([...fileList].map(async f => ({
+    name: f.name, blob: new Blob([await f.arrayBuffer()], { type: f.type || "image/jpeg" }) })));
+}
+for (const id of ["up", "cam"]) $(id).onchange = async e => {
+  try { const items = await snapshot(e.target.files); e.target.value = ""; enroll(items); }
+  catch (err) { e.target.value = ""; $("msg").textContent = "Could not read the selected file: " + (err.message || err); }
+};
+for (const id of ["t1", "t2"]) $(id).onchange = async e => {
+  try { const items = await snapshot(e.target.files); e.target.value = ""; if (items[0]) test(items[0].blob); }
+  catch (err) { e.target.value = ""; $("out").textContent = "Could not read the selected file: " + (err.message || err); }
+};
+$("dbgIn").onchange = async e => {
+  const out = $("dbg"); out.textContent = "Running…";
+  try {
+    const [item] = await snapshot(e.target.files); e.target.value = "";
+    const img = await loadImg(item.blob), c = toCanvas(img, 0);
+    const px = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+    let sum = 0, n = 0;
+    for (let i = 0; i < px.length; i += 200) { sum += px[i] + px[i + 1] + px[i + 2]; n += 3; }
+    const lines = ["Backend: " + faceapi.tf.getBackend(), `Analyzed size: ${c.width}x${c.height}`,
+      "Avg brightness: " + (sum / n).toFixed(0) + "/255 (near 0 = blank image)"];
+    for (const deg of [0, 90, 270]) {
+      const cv = toCanvas(img, deg);
+      const a = await faceapi.detectAllFaces(cv, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.1 }));
+      const b = await faceapi.detectAllFaces(cv, new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.1 }));
+      const s = l => l.length ? l.map(d => d.score.toFixed(2)).join(", ") : "none";
+      lines.push(`Rotation ${deg}: SSD [${s(a)}]  Tiny [${s(b)}]`);
+    }
+    out.textContent = lines.join("\n"); out.style.whiteSpace = "pre-wrap";
+    c.style.cssText = "max-width:100%;margin-top:8px;border-radius:8px"; out.appendChild(c);
+  } catch (err) { out.textContent = "Debug error: " + (err.message || err); }
+};
+
+let stream = null, running = false, facing = "user", loopId = 0;
+
+async function startCam() {
+  if (!ready) { $("liveMsg").textContent = "Models still loading…"; return; }
+  stopCam();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  } catch (e) { $("liveMsg").textContent = "Camera blocked or unavailable. Allow camera access in your browser settings."; return; }
+  const v = $("vid");
+  v.srcObject = stream; v.classList.toggle("mirror", facing === "user");
+  await v.play();
+  running = true; $("stage").style.display = "block"; $("liveMsg").textContent = "";
+  loop();
+}
+
+function stopCam() {
+  running = false; loopId++;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  $("stage").style.display = "none";
+}
+
+async function loop() {
+  const id = ++loopId, v = $("vid"), c = $("ov");
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+  while (running && id === loopId) {
+    if (v.videoWidth) {
+      if (c.width !== v.videoWidth) { c.width = v.videoWidth; c.height = v.videoHeight; }
+      try {
+        const faces = await faceapi.detectAllFaces(v, opts).withFaceLandmarks().withFaceDescriptors();
+        if (running && id === loopId) draw(c, faces);
+      } catch (e) { /* skip a bad frame */ }
+    }
+    await new Promise(r => requestAnimationFrame(r));
+  }
+}
+
+function draw(c, faces) {
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  const t = parseFloat($("th").value), mirror = facing === "user";
+  const fs = Math.max(14, Math.round(c.width / 28));
+  g.lineWidth = Math.max(2, c.width / 200); g.font = `bold ${fs}px system-ui`; g.textBaseline = "top";
+  for (const f of faces) {
+    const b = f.detection.box, d = Array.from(f.descriptor);
+    let best = { name: "", distance: Infinity };
+    for (const [n, list] of Object.entries(db))
+      for (const e of list) { const x = dist(d, e); if (x < best.distance) best = { name: n, distance: x }; }
+    const ok = best.distance < t;
+    const score = isFinite(best.distance) ? " " + best.distance.toFixed(2) : "";
+    const label = ok ? best.name + score : "unknown" + score;
+    const x = mirror ? c.width - b.x - b.width : b.x;
+    const color = ok ? "#16a34a" : "#dc2626";
+    g.strokeStyle = color; g.strokeRect(x, b.y, b.width, b.height);
+    const w = g.measureText(label).width + 8, h = fs + 8, ty = Math.max(0, b.y - h);
+    g.fillStyle = color; g.fillRect(x, ty, w, h);
+    g.fillStyle = "#fff"; g.fillText(label, x + 4, ty + 4);
+  }
+}
+
+$("camStart").onclick = startCam;
+$("camStop").onclick = stopCam;
+$("camFlip").onclick = () => { facing = facing === "user" ? "environment" : "user"; if (running) startCam(); };
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopCam(); });
+renderPeople();
+</script></body></html>
